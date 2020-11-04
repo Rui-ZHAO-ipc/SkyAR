@@ -8,13 +8,14 @@ from networks import *
 from skyboxengine import *
 import utils
 import torch
+from depth_estimator.inference_model import InferenceModel
 
 # Decide which device we want to run on
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 parser = argparse.ArgumentParser(description='SKYAR')
-parser.add_argument('--path', type=str, default='./config/config-annarbor-castle.json', metavar='str',
+parser.add_argument('--path', type=str, default='./config/config-hainan-jupiter.json', metavar='str',
                     help='configurations')
 
 class SkyFilter():
@@ -67,7 +68,7 @@ class SkyFilter():
         cv2.waitKey(1)
 
 
-    def synthesize(self, img_HD, img_HD_prev):
+    def synthesize(self, img_HD, img_HD_prev, depth_estimator):
 
         h, w, c = img_HD.shape
 
@@ -86,7 +87,7 @@ class SkyFilter():
 
         skymask = self.skyboxengine.skymask_refinement(G_pred, img_HD)
 
-        syneth = self.skyboxengine.skyblend(img_HD, img_HD_prev, skymask)
+        syneth = self.skyboxengine.skyblend(img_HD, img_HD_prev, skymask, depth_estimator)
 
         return syneth, G_pred, skymask
 
@@ -125,7 +126,7 @@ class SkyFilter():
                 plt.imsave(fpath[:-4] + 'syneth.jpg', syneth.clip(min=0, max=1))
 
             self.write_video(img_HD, syneth)
-            print('processing: %d / %d ...' % (idx, len(img_names)))
+            # print('processing: %d / %d ...' % (idx, len(img_names)))
 
             img_HD_prev = img_HD
 
@@ -138,6 +139,10 @@ class SkyFilter():
         m_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         img_HD_prev = None
 
+        # load depth estimator
+        depth_estimator = InferenceModel()
+        depth_estimator.initialize()
+
         idx = 0
 
         while (1):
@@ -148,7 +153,7 @@ class SkyFilter():
                 if img_HD_prev is None:
                     img_HD_prev = img_HD
 
-                syneth, G_pred, skymask = self.synthesize(img_HD, img_HD_prev)
+                syneth, G_pred, skymask = self.synthesize(img_HD, img_HD_prev, depth_estimator)
 
                 if self.save_jpgs:
                     fpath = os.path.join(args.output_dir, str(idx)+'.jpg')
@@ -167,6 +172,7 @@ class SkyFilter():
                 break
 
     def run(self):
+
         if self.input_mode == 'seq':
             self.run_imgseq()
         elif self.input_mode == 'video':

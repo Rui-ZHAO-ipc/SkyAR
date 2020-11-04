@@ -2,6 +2,7 @@ from skybox_utils import *
 from cv2.ximgproc import guidedFilter
 import synrain
 import os
+import torchvision.transforms as transforms
 from train_motion_estimate import MotionEstimator
 
 class SkyBox():
@@ -139,59 +140,41 @@ class SkyBox():
 
         return m
 
-    def skybox_tracking_with_motion_estimate(self, frame, frame_prev, skymask):
+    def skybox_tracking_with_motion_estimate(self, frame, frame_prev, skymask, depth_estimator):
 
         prev_gray = cv2.cvtColor(frame_prev, cv2.COLOR_RGB2GRAY)
         prev_gray = np.array(255*prev_gray, dtype=np.uint8)
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         curr_gray = np.array(255*curr_gray, dtype=np.uint8)
 
-        mask = np.array(skymask[:,:,0] > 0.99, dtype=np.uint8)
+        front_mask = np.array(skymask[:, :, 0] < 0.5, dtype=np.uint8)
+        template_size = int(0.05*front_mask.shape[0])
+        front_mask = cv2.erode(front_mask, np.ones([template_size, template_size]))
 
-        template_size = int(0.05*mask.shape[0])
-        mask = cv2.erode(mask, np.ones([template_size, template_size]))
+        # cv2.imshow('test',curr_gray * front_mask/255.)
 
-        front_mask = np.array(skymask[:, :, 0] < 0.9, dtype=np.uint8)
         flow = cv2.calcOpticalFlowFarneback(prev_gray * front_mask, curr_gray * front_mask, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-        checkpoint = './motion_estimator_checkpoint/BEST_Resnet50_Motion_Estimate.pth.tar'
+
+        # calculate depth map
+        transform = transforms.Compose([transforms.Lambda(lambda img: cv2.resize(img, (1024, 256))),
+                                        transforms.ToTensor(),
+                                        transforms.Normalize((0.5, 0.5, 0.5),
+                                                             (0.5, 0.5, 0.5))])
+        img_HD_RGB = transform(frame*255).unsqueeze(0)
+        depth_map = depth_estimator.test(img_HD_RGB, flow.shape[1], flow.shape[0])
+        flow_depth = np.concatenate((flow, depth_map[..., np.newaxis]), axis=-1)
+
+        checkpoint = './motion_estimator/checkpoints/Resnet50_Motion_Estimator_51.pth.tar'
         # Load model
         checkpoint = torch.load(checkpoint)
-        etimator = checkpoint['etimator']
+        etimator = checkpoint['estimator']
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         etimator = etimator.to(device)
-        dxdyda_es = etimator(torch.FloatTensor(flow).permute(2,0,1).unsqueeze(0).to(device))
+        dxdyda_es = etimator(torch.FloatTensor(flow_depth).permute(2,0,1).unsqueeze(0).to(device))
 
         dxdyda_es = dxdyda_es.cpu().detach().numpy()
-        dxdyda_new = [dxdyda_es[0,0],dxdyda_es[0,1],dxdyda_es[0,2]]
-        # ShiTomasi corner detection
-        prev_pts = cv2.goodFeaturesToTrack(
-            prev_gray, mask=mask, maxCorners=200,
-            qualityLevel=0.01, minDistance=30, blockSize=3)
-
-        if prev_pts is None:
-            print('no feature point detected')
-            return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-
-        # Calculate optical flow (i.e. track feature points)
-        curr_pts, status, err = cv2.calcOpticalFlowPyrLK(
-            prev_gray, curr_gray, prev_pts, None)
-        # Filter only valid points
-        idx = np.where(status == 1)[0]
-        if idx.size == 0:
-            print('no good point matched')
-            return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-
-        prev_pts, curr_pts = removeOutliers(prev_pts, curr_pts)
-
-        if curr_pts.shape[0] < 10:
-            print('no good point matched')
-            return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-
-        # limit the motion to translation + rotation
-        dxdyda = estimate_partial_transform((
-            np.array(prev_pts), np.array(curr_pts)))
-
-        print([dxdyda, dxdyda_new])
+        dxdyda_new = [dxdyda_es[0,0],dxdyda_es[0,1],dxdyda_es[0,2] * 1e-2]
+        print(dxdyda_new)
 
         m = build_transformation_matrix(dxdyda_new)
 
@@ -229,10 +212,10 @@ class SkyBox():
 
         return syneth_with_halo
 
-    def skyblend(self, img, img_prev, skymask):
+    def skyblend(self, img, img_prev, skymask, depth_estimator):
 
         # m = self.skybox_tracking(img, img_prev, skymask)
-        m = self.skybox_tracking_with_motion_estimate(img, img_prev, skymask)
+        m = self.skybox_tracking_with_motion_estimate(img, img_prev, skymask, depth_estimator)
 
         skybg = self.get_skybg_from_box(m)
 

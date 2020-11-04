@@ -4,10 +4,27 @@ import torchvision
 from torch.utils.data import Dataset
 import time
 import visdom
+from tqdm import tqdm
+from depth_estimator.inference_model import InferenceModel
+import torchvision.transforms as transforms
 
 # Decide which device we want to run on
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 viz = visdom.Visdom(env='train')
+
+def get_gradation_2d(start, stop, width, height, is_horizontal):
+    if is_horizontal:
+        return np.tile(np.linspace(start, stop, width), (height, 1))
+    else:
+        return np.tile(np.linspace(start, stop, height), (width, 1)).T
+
+def get_gradation_3d(width, height, start_list, stop_list, is_horizontal_list):
+    result = np.zeros((height, width, len(start_list)), dtype=np.float)
+
+    for i, (start, stop, is_horizontal) in enumerate(zip(start_list, stop_list, is_horizontal_list)):
+        result[:, :, i] = get_gradation_2d(start, stop, width, height, is_horizontal)
+
+    return result
 
 
 class DataMaker(object):
@@ -15,6 +32,7 @@ class DataMaker(object):
         self.name = 'motion_estimator'
         #
         self.datadir = ''
+        self.folder_path = ''
         self.in_size_w = 384
         self.in_size_h = 384
         self.out_size_w = 845
@@ -26,21 +44,51 @@ class DataMaker(object):
         self.net_G.to(device)
         self.net_G.eval()
 
-    def prepare_data(self, video_path):
+    def prepare_data_folder(self, folder_path):
+        # load depth estimator
+        depth_estimator = InferenceModel()
+        depth_estimator.initialize()
+
+        self.folder_path =folder_path
+        train_folder = folder_path+'/video/Train'
+        Val_folder = folder_path + '/video/Val'
+        for train_path in os.listdir(train_folder):
+            self.prepare_data(os.path.join(train_folder, train_path), depth_estimator, 'Train')
+        for val_path in os.listdir(Val_folder):
+            self.prepare_data(os.path.join(Val_folder, val_path), depth_estimator, 'Val')
+
+    def prepare_data(self, video_path, depth_estimator, split):
+        step = 30
         self.datadir = video_path
         cap = cv2.VideoCapture(self.datadir)
         m_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         img_HD_prev = None
-        idx = 0
-        while (1):
+        # idx = -1
+        for idx in tqdm(range(m_frames)):
+        # while (1):
             ret, frame = cap.read()
             if ret:
-                img_HD = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img_HD = np.array(img_HD / 255., dtype=np.float32)
+                # idx += 1
+                if idx % step > 1:
+                    continue
+                img_HD_RGB = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img_HD = np.array(img_HD_RGB / 255., dtype=np.float32)
                 img_HD = cv2.resize(img_HD, (self.out_size_w, self.out_size_h))
 
                 if img_HD_prev is None:
                     img_HD_prev = img_HD
+
+                if idx % step == 0:
+                    img_HD_prev = img_HD
+                    continue
+
+                # calculate depth map
+                transform = transforms.Compose([transforms.Lambda(lambda img: cv2.resize(img, (1024, 256))),
+                                                transforms.ToTensor(),
+                                                transforms.Normalize((0.5, 0.5, 0.5),
+                                                                     (0.5, 0.5, 0.5))])
+                img_HD_RGB = transform(img_HD_RGB).unsqueeze(0)
+                depth_map = depth_estimator.test(img_HD_RGB, self.out_size_w, self.out_size_h)
 
                 h, w, c = img_HD.shape
 
@@ -65,19 +113,19 @@ class DataMaker(object):
 
                 skymask = np.clip(refined_skymask, a_min=0, a_max=1)
 
-                dxdyda = self._skybox_tracking(img_HD, img_HD_prev, skymask, idx)
+                dxdyda = self._skybox_tracking(img_HD, img_HD_prev, skymask, idx, depth_map, split)
 
-                print(dxdyda)
+                # print(dxdyda)
                 img_HD_prev = img_HD
-                idx += 1
+
 
             else:  # if reach the last frame
                 break
 
-    def _skybox_tracking(self, frame, frame_prev, skymask, frame_indx):
+    def _skybox_tracking(self, frame, frame_prev, skymask, frame_indx, depth_map, split):
 
         if np.mean(skymask) < 0.05:
-            print('sky area is too small')
+            # print('sky area is too small')
             return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
 
         prev_gray = cv2.cvtColor(frame_prev, cv2.COLOR_RGB2GRAY)
@@ -86,18 +134,30 @@ class DataMaker(object):
         curr_gray = np.array(255*curr_gray, dtype=np.uint8)
 
         mask = np.array(skymask[:,:,0] > 0.99, dtype=np.uint8)
-        front_mask = np.array(skymask[:, :, 0] < 0.9, dtype=np.uint8)
-
         template_size = int(0.05*mask.shape[0])
         mask = cv2.erode(mask, np.ones([template_size, template_size]))
 
-        flow = cv2.calcOpticalFlowFarneback(prev_gray*front_mask, curr_gray*front_mask, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        front_mask = np.array(skymask[:, :, 0] < 0.5, dtype=np.uint8)
+        template_size = int(0.05*front_mask.shape[0])
+        front_mask = cv2.erode(front_mask, np.ones([template_size, template_size]))
 
+        # front_mask[int(front_mask.shape[0]/3*2):front_mask.shape[0],:] = 0
+
+        # mask_min = (front_mask!=0).argmax(axis=0).min()
+        # mask_max = front_mask.shape[0]
+        # changed_mask_1 = get_gradation_3d(front_mask.shape[1], mask_max-mask_min,  (100, 100), (0, 0), (False, False))
+        # changed_mask_0 = np.zeros((mask_min, front_mask.shape[1], 2))
+        # flow_mask = np.concatenate((changed_mask_0, changed_mask_1))
+
+        flow = cv2.calcOpticalFlowFarneback(prev_gray*front_mask, curr_gray*front_mask, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        flow_depth = np.concatenate((flow, depth_map[..., np.newaxis]), axis=-1)
+        # flow = flow*flow_mask
+        # cv2.imshow('flow', flow[...,1])
         # show flow
         # hsv = np.zeros_like(frame_prev)
         # hsv[..., 1] = 255
         # mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-        # hsv[..., 0] = ang * 180 / np.pi / 2
+        # hsv[..., 0] = 255  #ang * 180 / np.pi / 2
         # hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
         # rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
         #
@@ -111,7 +171,7 @@ class DataMaker(object):
             qualityLevel=0.01, minDistance=30, blockSize=3)
 
         if prev_pts is None:
-            print('no feature point detected')
+            # print('no feature point detected')
             return np.array([[0, 0, 0]], dtype=np.float32)
             # return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
 
@@ -122,14 +182,14 @@ class DataMaker(object):
         # Filter only valid points
         idx = np.where(status == 1)[0]
         if idx.size == 0:
-            print('no good point matched')
+            # print('no good point matched')
             return np.array([[0, 0, 0]], dtype=np.float32)
             # return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
 
         prev_pts, curr_pts = removeOutliers(prev_pts, curr_pts)
 
         if curr_pts.shape[0] < 10:
-            print('no good point matched')
+            # print('no good point matched')
             return np.array([[0, 0, 0]], dtype=np.float32)
             # return np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
 
@@ -140,20 +200,20 @@ class DataMaker(object):
         # if frame_indx == 0:
         #     return np.array([[0, 0, 0]], dtype=np.float32)
         dataname = os.path.splitext(os.path.basename(self.datadir))[0]
-        if not os.path.exists('./data/flow/'):
-            os.mkdir('./data/flow')
-            os.mkdir('./data/flow/Train')
-            os.mkdir('./data/flow/Val')
-        if not os.path.exists('./data/dxdyda'):
-            os.mkdir('./data/dxdyda')
-            os.mkdir('./data/dxdyda/Train')
-            os.mkdir('./data/dxdyda/Val')
-        if frame_indx % 10 == 0:
-            np.save('./data/flow/Val/'+dataname+'_flow_'+str(frame_indx), flow)
-            np.save('./data/dxdyda/Val/' + dataname + '_dxdyda_' + str(frame_indx), dxdyda)
+        if not os.path.exists(self.folder_path + '/flow/'):
+            os.mkdir(self.folder_path + '/flow/')
+            os.mkdir(self.folder_path + '/flow/Train')
+            os.mkdir(self.folder_path + '/flow/Val')
+        if not os.path.exists(self.folder_path + '/dxdyda'):
+            os.mkdir(self.folder_path + '/dxdyda')
+            os.mkdir(self.folder_path + '/dxdyda/Train')
+            os.mkdir(self.folder_path + '/dxdyda/Val')
+        if split == 'Val':
+            np.save(self.folder_path + '/flow/Val/'+dataname+'_flow_'+str(frame_indx), flow_depth)
+            np.save(self.folder_path + '/dxdyda/Val/' + dataname + '_dxdyda_' + str(frame_indx), dxdyda)
         else:
-            np.save('./data/flow/Train/' + dataname + '_flow_' + str(frame_indx), flow)
-            np.save('./data/dxdyda/Train/' + dataname + '_dxdyda_' + str(frame_indx), dxdyda)
+            np.save(self.folder_path + '/flow/Train/' + dataname + '_flow_' + str(frame_indx), flow_depth)
+            np.save(self.folder_path + '/dxdyda/Train/' + dataname + '_dxdyda_' + str(frame_indx), dxdyda)
 
         # m = build_transformation_matrix(dxdyda)
 
@@ -185,10 +245,10 @@ class MotionEstimator(nn.Module):
 
     def __init__(self):
         super(MotionEstimator, self).__init__()
-        net = torchvision.models.resnet50(pretrained=False)
+        net = torchvision.models.resnet50(pretrained=True)
         num_ftrs = net.fc.in_features
         net.fc = nn.Linear(num_ftrs, 3)
-        net.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        # net.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.net = net
 
     def forward(self, flow):
@@ -228,6 +288,8 @@ def train(train_loader, estimator, optimizer, criterion, epoch):
     estimator.train()
     start_time = time.time()
 
+    losses = 0
+
     for i, (flow, dxdyda) in enumerate(train_loader):
 
         flow = flow.to(device)
@@ -239,6 +301,8 @@ def train(train_loader, estimator, optimizer, criterion, epoch):
         pri_dxdyda = estimator(flow)
 
         # Calculate loss
+        dxdyda[:,-1]*=1e2
+
         loss = criterion(pri_dxdyda, dxdyda)
 
         loss.backward()
@@ -249,14 +313,15 @@ def train(train_loader, estimator, optimizer, criterion, epoch):
         epoch_time = time.time() - start_time
         start_time = time.time()
         # Print status
-        losses = loss.item()
+        losses += loss.item()
         print_freq = 10
         if i % print_freq == 0:
-            viz.line(X=torch.FloatTensor([epoch * math.ceil(len(train_loader) / print_freq) + i // print_freq]), Y=torch.FloatTensor([loss.item()]), win='Train_Loss', name='1', update='append')
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Epoch Time {epoch_time:.3f}\t'
-                  'Loss {loss:.4f}'.format(epoch, i, len(train_loader),
-                                                                          epoch_time=epoch_time, loss=losses))
+                  'Loss {loss:.4f}'.format(epoch, i, len(train_loader), epoch_time=epoch_time, loss=loss.item()))
+
+    losses = losses/len(train_loader)
+    viz.line(X=torch.FloatTensor([epoch]), Y=torch.FloatTensor([losses]), win='Train Loss', name='0', update='append')
 
 
 def validate(val_loader, estimator, criterion):
@@ -275,6 +340,8 @@ def validate(val_loader, estimator, criterion):
             pri_dxdyda = estimator(flow)
 
             # Calculate loss
+            # loss = criterion(pri_dxdyda, dxdyda)
+            dxdyda[:, -1] *= 1e2
             loss = criterion(pri_dxdyda, dxdyda)
 
             losses+=loss
@@ -286,14 +353,15 @@ def validate(val_loader, estimator, criterion):
 
 
 def main():
-    encoder_lr = 1e-6
+    encoder_lr = 1e-4
     batch_size = 12
     workers = 4
     epochs = 200
-    data_folder = './data'
-    checkpoint_path = './motion_estimator_checkpoint'
-    checkpoint_name = 'Resnet50_Motion_Estimate'
-    last_checkpoint = './motion_estimator_checkpoint/BEST_Resnet50_Motion_Estimate.pth.tar'
+    data_folder = './motion_estimator/data'
+    checkpoint_path = './motion_estimator/checkpoints'
+    checkpoint_name = 'Resnet50_Motion_Estimator'
+    # last_checkpoint = './motion_estimator/checkpoints/BEST_Resnet50_Motion_Estimator.pth.tar'
+    last_checkpoint = None
 
     if last_checkpoint is None:
         start_epoch = 0
@@ -306,8 +374,10 @@ def main():
     else:
         checkpoint = torch.load(last_checkpoint)
         start_epoch = checkpoint['epoch'] + 1
-        estimator = checkpoint['etimator']
-        optimizer = checkpoint['optimizer']
+        estimator = checkpoint['estimator']
+        # optimizer = checkpoint['optimizer']
+        optimizer = torch.optim.Adam(params=filter(lambda p: p.requires_grad, estimator.parameters()),
+                                     lr=encoder_lr)
         epochs_since_improvement = checkpoint['epochs_since_improvement']
         highest_losses = checkpoint['recent_losses']
 
@@ -354,7 +424,8 @@ if __name__ == '__main__':
     makedata = False
     if makedata:
         datamaker = DataMaker()
-        datamaker.prepare_data('./test_videos/canyon.mp4')
+        datamaker.prepare_data_folder('./motion_estimator/data')
+        main()
     else:
         # activate visdom sever: python -m visdom.server
         main()
