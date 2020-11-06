@@ -153,7 +153,7 @@ class SkyBox():
 
         # cv2.imshow('test',curr_gray * front_mask/255.)
 
-        flow = cv2.calcOpticalFlowFarneback(prev_gray * front_mask, curr_gray * front_mask, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
 
         # calculate depth map
         transform = transforms.Compose([transforms.Lambda(lambda img: cv2.resize(img, (1024, 256))),
@@ -162,9 +162,21 @@ class SkyBox():
                                                              (0.5, 0.5, 0.5))])
         img_HD_RGB = transform(frame*255).unsqueeze(0)
         depth_map = depth_estimator.test(img_HD_RGB, flow.shape[1], flow.shape[0])
+        front_mask[depth_map<0.8]=0
+        flow = flow * front_mask[..., np.newaxis]
+        depth_map = depth_map * front_mask
+        depth_map = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX)
+        flow[..., 0] = flow[..., 0] * depth_map
+
+        # cv2.imshow('video', curr_gray)
+        # cv2.imshow('flow', abs(flow[...,0]))
+        # cv2.imshow('depth_map', depth_map)
+        # cv2.imshow('front_mask', front_mask)
+        # k=cv2.waitKey(30)
+
         flow_depth = np.concatenate((flow, depth_map[..., np.newaxis]), axis=-1)
 
-        checkpoint = './motion_estimator/checkpoints/Resnet50_Motion_Estimator_51.pth.tar'
+        checkpoint = './motion_estimator/checkpoints/Resnet50_Motion_Estimator_154.pth.tar'
         # Load model
         checkpoint = torch.load(checkpoint)
         etimator = checkpoint['estimator']

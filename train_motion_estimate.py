@@ -7,6 +7,8 @@ import visdom
 from tqdm import tqdm
 from depth_estimator.inference_model import InferenceModel
 import torchvision.transforms as transforms
+from torch.optim import lr_scheduler
+import random
 
 # Decide which device we want to run on
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -130,6 +132,18 @@ class DataMaker(object):
 
         prev_gray = cv2.cvtColor(frame_prev, cv2.COLOR_RGB2GRAY)
         prev_gray = np.array(255*prev_gray, dtype=np.uint8)
+        if random.random()>0.95:
+            # cv2.imshow('prev_gray',prev_gray)
+            height, width = prev_gray.shape[:2]
+            center = (width // 2, height // 2)
+            rotation = random.randint(-30, 30)*0.1
+            # print('rotate',rotation)
+            M = cv2.getRotationMatrix2D(center, -rotation, 1)
+            prev_gray = cv2.warpAffine(prev_gray, M, (width, height))
+            # cv2.imshow('prev_gray_rotate', prev_gray)
+            # k=cv2.waitKey(30)
+
+
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         curr_gray = np.array(255*curr_gray, dtype=np.uint8)
 
@@ -149,7 +163,19 @@ class DataMaker(object):
         # changed_mask_0 = np.zeros((mask_min, front_mask.shape[1], 2))
         # flow_mask = np.concatenate((changed_mask_0, changed_mask_1))
 
-        flow = cv2.calcOpticalFlowFarneback(prev_gray*front_mask, curr_gray*front_mask, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        front_mask[depth_map < 0.8] = 0
+        flow = flow * front_mask[..., np.newaxis]
+        depth_map = depth_map*front_mask
+        depth_map = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX)
+        flow[...,0] = flow[...,0]*depth_map
+
+        # cv2.imshow('video', curr_gray)
+        # cv2.imshow('flow', abs(flow[...,0]))
+        # cv2.imshow('depth_map', depth_map)
+        # cv2.imshow('front_mask', front_mask)
+        # k=cv2.waitKey(30)
+
         flow_depth = np.concatenate((flow, depth_map[..., np.newaxis]), axis=-1)
         # flow = flow*flow_mask
         # cv2.imshow('flow', flow[...,1])
@@ -284,7 +310,7 @@ def save_checkpoint(checkpoint_path, checkpoint_name, epoch, epochs_since_improv
     torch.save(state, checkpoint_path+'/'+ checkpoint_name + '_'+str(epoch)+'.pth.tar')
 
 
-def train(train_loader, estimator, optimizer, criterion, epoch):
+def train(train_loader, estimator, optimizer, scheduler, criterion, epoch):
     estimator.train()
     start_time = time.time()
 
@@ -301,7 +327,7 @@ def train(train_loader, estimator, optimizer, criterion, epoch):
         pri_dxdyda = estimator(flow)
 
         # Calculate loss
-        dxdyda[:,-1]*=1e2
+        dxdyda[:,-1]*=1e3
 
         loss = criterion(pri_dxdyda, dxdyda)
 
@@ -319,6 +345,9 @@ def train(train_loader, estimator, optimizer, criterion, epoch):
             print('Epoch: [{0}][{1}/{2}]\t'
                   'Epoch Time {epoch_time:.3f}\t'
                   'Loss {loss:.4f}'.format(epoch, i, len(train_loader), epoch_time=epoch_time, loss=loss.item()))
+
+    scheduler.step(epoch)
+    print('Epoch: [{}] Learning Rate: {}'.format(epoch, optimizer.param_groups[0]['lr']))
 
     losses = losses/len(train_loader)
     viz.line(X=torch.FloatTensor([epoch]), Y=torch.FloatTensor([losses]), win='Train Loss', name='0', update='append')
@@ -341,10 +370,10 @@ def validate(val_loader, estimator, criterion):
 
             # Calculate loss
             # loss = criterion(pri_dxdyda, dxdyda)
-            dxdyda[:, -1] *= 1e2
+            dxdyda[:, -1] *= 1e3
             loss = criterion(pri_dxdyda, dxdyda)
 
-            losses+=loss
+            losses+=loss.item()
         losses = losses/len(val_loader)
         print(
             '\n * Val Loss: {loss:.3f}\n'.format(loss=losses))
@@ -356,11 +385,11 @@ def main():
     encoder_lr = 1e-4
     batch_size = 12
     workers = 4
-    epochs = 200
+    epochs = 1000
     data_folder = './motion_estimator/data'
     checkpoint_path = './motion_estimator/checkpoints'
     checkpoint_name = 'Resnet50_Motion_Estimator'
-    # last_checkpoint = './motion_estimator/checkpoints/BEST_Resnet50_Motion_Estimator.pth.tar'
+    # last_checkpoint = './motion_estimator/checkpoints/Resnet50_Motion_Estimator_92.pth.tar'
     last_checkpoint = None
 
     if last_checkpoint is None:
@@ -381,7 +410,9 @@ def main():
         epochs_since_improvement = checkpoint['epochs_since_improvement']
         highest_losses = checkpoint['recent_losses']
 
-    criterion = nn.MSELoss().to(device)
+    criterion = nn.L1Loss().to(device)
+
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
 
     train_loader = torch.utils.data.DataLoader(
         MotionDataset(data_folder, 'Train'),
@@ -397,7 +428,7 @@ def main():
         #     adjust_learning_rate(optimizer, 0.01)  # 0.8
 
         # One epoch's training
-        train(train_loader=train_loader, estimator = estimator, optimizer=optimizer, criterion=criterion, epoch=epoch)
+        train(train_loader=train_loader, estimator = estimator, optimizer=optimizer, scheduler=scheduler, criterion=criterion, epoch=epoch)
 
         # One epoch's validation
         recent_losses = validate(val_loader=val_loader, estimator=estimator, criterion=criterion)
